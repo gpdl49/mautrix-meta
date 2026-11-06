@@ -137,6 +137,9 @@ func (ic *IGClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matri
 	if ic.LoginMeta.Cookies == nil {
 		return nil, bridgev2.ErrNotLoggedIn
 	}
+	if err := ic.checkHold(ctx, msg); err != nil { // homestacks: held messages
+		return nil, err
+	}
 	_, err := ic.ensureIGID(ctx, msg.Portal)
 	if errors.Is(err, instameow.ErrThreadNotFound) && msg.Content.MsgType == event.MsgText && msg.Portal.RoomType == database.RoomTypeDM {
 		// Allow sending text DMs even if the thread isn't known
