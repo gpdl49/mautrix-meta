@@ -39,6 +39,9 @@ func (ic *IGClient) FetchMessages(ctx context.Context, params bridgev2.FetchMess
 	if err != nil {
 		return nil, err
 	}
+	if params.Forward && frozenPortal(params.Portal.PortalKey) { // homestacks: frozen chats
+		return &bridgev2.FetchMessagesResponse{Forward: true}, nil
+	}
 	if params.Forward {
 		return ic.fetchForwardBackfill(ctx, params, meta)
 	}

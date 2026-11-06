@@ -137,6 +137,9 @@ func (ic *IGClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matri
 	if ic.LoginMeta.Cookies == nil {
 		return nil, bridgev2.ErrNotLoggedIn
 	}
+	if err := ic.checkFrozenSend(msg.Portal); err != nil { // homestacks: frozen chats
+		return nil, err
+	}
 	if err := ic.checkHold(ctx, msg); err != nil { // homestacks: held messages
 		return nil, err
 	}

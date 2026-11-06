@@ -45,6 +45,7 @@ func (ic *IGConnector) Init(bridge *bridgev2.Bridge) {
 	ic.DB = metadb.New(bridge.ID, bridge.DB.Database, ic.Bridge.Log.With().Str("db_section", "meta").Logger())
 	ic.MsgConv = igconv.New(bridge, ic.DB)
 	bridge.Commands.(*commands.Processor).AddHandlers(cmdSchedule, cmdOfflineHours, cmdTimezone) // homestacks: held messages
+	bridge.Commands.(*commands.Processor).AddHandlers(cmdFreeze, cmdUnfreeze)                    // homestacks: frozen chats
 	ic.MsgConv.DisableViewOnce = ic.Config.DisableViewOnce
 }
 
@@ -56,6 +57,9 @@ func (ic *IGConnector) Start(ctx context.Context) error {
 	}
 	if err = ic.startHeldMessages(ctx); err != nil { // homestacks: held messages
 		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_heldmsg"}
+	}
+	if err = ic.startFreeze(ctx); err != nil { // homestacks: frozen chats
+		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_freeze"}
 	}
 	return nil
 }
