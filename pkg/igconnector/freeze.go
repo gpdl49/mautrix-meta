@@ -350,7 +350,7 @@ func (ic *IGConnector) frozenClient(ctx context.Context, loginID networkid.UserL
 	}
 	client, ok := login.Client.(*IGClient)
 	if !ok || !client.heldReady() {
-		return nil, fmt.Errorf("Instagram account %s is %w", login.RemoteName, errFrozenLoginOffline)
+		return nil, fmt.Errorf("the Instagram account %s is %w", login.RemoteName, errFrozenLoginOffline)
 	}
 	return client, nil
 }
