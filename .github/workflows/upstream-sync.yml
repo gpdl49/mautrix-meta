@@ -1,0 +1,126 @@
+name: upstream-sync
+
+# Keeps the `homestacks` branch on top of upstream releases. Merges (never
+# rebases) the newest mautrix/meta release tag that is not yet in the
+# branch, verifies the fork still builds and passes its tests, pushes, tags
+# the result vX.Y.Z-hs.1 and hands it to publish.yml. On a merge conflict it
+# opens an issue and leaves the branch untouched. See HOMESTACKS.md.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  packages: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+  UPSTREAM: https://github.com/mautrix/meta.git
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.merge.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: homestacks
+          fetch-depth: 0
+
+      - name: Find newest upstream release not yet merged
+        id: find
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet --tags upstream
+          latest=$(git tag --list 'v0.*' | grep -E '^v0\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            echo "::error::no upstream release tags found"; exit 1
+          fi
+          if git merge-base --is-ancestor "$latest" HEAD; then
+            echo "homestacks already contains $latest"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "will merge $latest"
+            echo "tag=$latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream tag
+        id: merge
+        if: steps.find.outputs.tag != ''
+        env:
+          TAG: ${{ steps.find.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge --no-ff "$TAG" -m "Merge upstream $TAG into homestacks"; then
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U | tee conflicts.txt
+            echo "conflicts<<EOF" >> "$GITHUB_OUTPUT"
+            cat conflicts.txt >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "::error::merge of $TAG conflicts"
+            exit 1
+          fi
+
+      - name: Open issue on merge conflict
+        if: failure() && steps.merge.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.find.outputs.tag }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          title="Upstream merge conflict: $TAG"
+          body=$(printf 'Automatic merge of upstream `%s` into `homestacks` failed.\n\nConflicting files:\n```\n%s\n```\n\nResolve by hand as described in HOMESTACKS.md, then re-run this workflow.\n\nRun: %s/%s/actions/runs/%s' \
+            "$TAG" "$CONFLICTS" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body" --label upstream-sync
+          fi
+
+      - uses: actions/setup-go@v7
+        if: steps.merge.outputs.tag != ''
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build, vet and test
+        if: steps.merge.outputs.tag != ''
+        run: |
+          go build -tags goolm ./...
+          go vet -tags goolm ./...
+          go test -tags goolm ./pkg/...
+
+      - name: Push branch and release tag
+        if: steps.merge.outputs.tag != ''
+        env:
+          TAG: ${{ steps.merge.outputs.tag }}
+        run: |
+          release="${TAG}-hs.1"
+          if git ls-remote --exit-code --tags origin "refs/tags/$release" >/dev/null; then
+            echo "::error::tag $release already exists on origin"; exit 1
+          fi
+          git push origin homestacks
+          git tag -a "$release" -m "$release: upstream $TAG + homestacks patches"
+          git push origin "$release"
+          echo "tag=$release" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: sync
+    if: needs.sync.outputs.tag != ''
+    uses: ./.github/workflows/publish.yml
+    with:
+      ref: ${{ needs.sync.outputs.tag }}-hs.1
+    permissions:
+      contents: read
+      packages: write

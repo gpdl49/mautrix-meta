@@ -1,0 +1,73 @@
+name: publish
+
+# Builds the bridge image from upstream's unmodified Dockerfile.ig (the Instagram bridge; the plain
+# Dockerfile builds the Facebook/Messenger one) and pushes it
+# to ghcr.io/gpdl49/mautrix-meta. Triggered by pushing a fork release tag
+# (vX.Y.Z-hs.N), by hand, or by upstream-sync.yml after a successful merge.
+# See HOMESTACKS.md.
+
+on:
+  push:
+    tags:
+      - "v*-hs.*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag to build (vX.Y.Z-hs.N)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: "Tag to build (vX.Y.Z-hs.N)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/gpdl49/mautrix-meta
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve ref
+        id: ref
+        run: |
+          ref='${{ inputs.ref || github.ref_name }}'
+          case "$ref" in
+            v*-hs.*) ;;
+            *) echo "::error::ref '$ref' is not a fork release tag (vX.Y.Z-hs.N)"; exit 1 ;;
+          esac
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.ref.outputs.tag }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ig
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.ref.outputs.tag }}
+            ${{ env.IMAGE }}:homestacks
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.ref.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
