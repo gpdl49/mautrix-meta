@@ -325,6 +325,9 @@ func (ic *IGClient) connectWithRetry(retryCtx, ctx context.Context, attempts int
 				Message:    gqlErr.Message,
 			})
 		} else {
+			if ic.retryTransientConnectError(retryCtx, ctx, err, attempts) { // homestacks: retry 5xx/429/network failures instead of giving up for good
+				return
+			}
 			ic.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateUnknownError,
 				Error:      MetaConnectError,

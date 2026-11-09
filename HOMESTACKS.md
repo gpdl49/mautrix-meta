@@ -9,8 +9,9 @@ this file first when an upstream merge conflicts.
 
 ## What the fork adds
 
-Three features, all driven from the chat's own room with the `!ig` prefix. The code was copied from the
-WhatsApp fork (no shared module) and adapted; differences are listed at the end.
+Three features, all driven from the chat's own room with the `!ig` prefix, plus one reliability fix
+(connection retries, below). The features were copied from the WhatsApp fork (no shared module) and
+adapted; differences are listed at the end.
 
 ### Held messages: scheduling and offline hours
 
@@ -107,6 +108,28 @@ username to a thread; Instagram's lives in `startchat.go` and creates the chat. 
 write a read-only lookup rather than reusing the chat-starting path. A chat that was deleted while frozen
 is not handled: its next event would recreate the portal through the usual resync.
 
+### Connection retries after transient failures
+
+Upstream's `connectWithRetry` retries only Meta `lserror` responses. Any other failure to load the inbox
+that is not a known account problem sends `UNKNOWN_ERROR` and returns. It doesn't retry and doesn't
+reschedule the periodic reconnect, so the login stays disconnected until the bridge restarts. On
+2026-11-08 the 20h periodic reconnect hit six HTTP 503s from `instagram.com/direct/inbox/` and the bridge
+stayed down for about 34 hours. Upstream `main` still had the same code on 2026-11-09.
+
+The fork treats an error wrapping `httpclient.ErrMaxRetriesReached` as transient. The HTTP client only
+returns that after retrying a 5xx, a 429 or a network error itself; 4xx and other permanent errors come
+back unwrapped and keep upstream's behaviour. A transient failure sends `TRANSIENT_DISCONNECT` and calls
+`connectWithRetry` again with upstream's backoff (2s doubling to 1024s, `MaxConnectRetries` = 10, about 34
+minutes in all). When those run out, `UNKNOWN_ERROR` is sent as before, and a full reconnect is also
+scheduled 30 minutes later (`transientRetryLaterDelay`). That reconnect starts a new round, so a long
+Instagram outage is retried indefinitely at roughly one round per hour. The scheduled reconnect uses
+`stopPeriodicReconnect`, so `Disconnect` cancels it. That includes bridgev2's own
+`bridge.unknown_error_auto_reconnect`, which the homestacks config also sets as a second safety net.
+
+The WhatsApp fork does not need this: whatsmeow already retries a failed first connect
+(`initial_auto_reconnect`, on by default) and reconnects by itself after 503 stream errors and 500/503
+connect failures.
+
 ## Branches and tags
 
 | Ref | Meaning |
@@ -140,6 +163,7 @@ All feature code lives in **new files**. Every hook into an upstream file is a s
 | `pkg/igconnector/handlematrix.go` | `checkFrozenSend` then `checkHold` guards (each an `if` with a `return`) in `HandleMatrixMessage`, after the login check and before `ensureIGID` |
 | `pkg/igconnector/handlemeta.go` | `checkFrozen` guard in `handleDelta`, right after the portal is ensured; `CheckNeedsBackfillFunc` field in `wrapChatResync`, set apart by a blank line so gofmt does not re-align upstream's fields |
 | `pkg/igconnector/backfill.go` | `frozenPortal` guard at the top of `FetchMessages` |
+| `pkg/igconnector/client.go` | `retryTransientConnectError` guard (an `if` with a `return`) at the top of the final `else` in `connectWithRetry`'s index-load error handling, before upstream's `MetaConnectError` `UNKNOWN_ERROR` |
 | `pkg/metaid/dbmeta.go` | `Timezone` field on `UserLoginMetadata`; one line in `CopyFrom` keeping it; `OfflineHours` field on `PortalMetadata` |
 
 New files:
@@ -152,6 +176,8 @@ New files:
 | `pkg/igconnector/freeze.go` | frozen chats: guard, `homestacks_frozen_chat`/`homestacks_frozen_event` tables, replay, resync guard, media refresh |
 | `pkg/igconnector/freeze_command.go` | `!ig freeze`, `!ig unfreeze` |
 | `pkg/igconnector/freeze_test.go` | delta round trip, digest dedup and ordering, hold/skip rules, resync guard, expired-media detection |
+| `pkg/igconnector/reconnect.go` | connection retries: transient-error check, retry with backoff, full reconnect scheduled after retries run out |
+| `pkg/igconnector/reconnect_test.go` | error classification on the real error chains, short-circuit cases, cancellation of the scheduled reconnect |
 | `pkg/metaid/offlinehours.go` | `OfflineHours` type stored in portal metadata |
 | `pkg/metaid/homestacks.go`, `homestacks_test.go` | `UserLoginMetadata.LoadTimezone`; `CopyFrom` keeps the timezone |
 | `pkg/instameow/homestacks.go` | `Client.IsConnected()`, the accessor held messages need (`connected` is private) |
@@ -188,8 +214,10 @@ git tag -a vX.Y.Z-hs.1 -m "..." && git push origin vX.Y.Z-hs.1   # publish.yml b
 If upstream changed something a feature relies on (`handleDelta`, `slidetypes.Delta` and its `Raw`,
 `wrapChatResync`/`simplevent.ChatResync.CheckNeedsBackfillFunc`, `PaginateMessages`/`GetThread`,
 `mediadl.ParseExpiryFromURL`, `Bridge.QueueMatrixEvent`, `matrix.ASIntent`, `commands.FullHandler`,
-`dbutil` upgrade tables, `UserLoginMetadata.CopyFrom`), the build or `go vet` step will say so; fix it in
-the `held*`/`freeze*` files rather than in upstream code.
+`dbutil` upgrade tables, `UserLoginMetadata.CopyFrom`, `connectWithRetry`/`MaxConnectRetries`,
+`stopPeriodicReconnect`, `FullReconnect`, `httpclient.ErrMaxRetriesReached`), the build or `go vet` step
+will say so; fix it in the `held*`/`freeze*`/`reconnect*` files rather than in upstream code. If upstream
+starts retrying these errors itself, drop the `retryTransientConnectError` hook and `reconnect*.go`.
 
 ## Building locally
 
