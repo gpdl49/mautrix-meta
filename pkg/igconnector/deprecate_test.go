@@ -23,7 +23,6 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/lib/pq"
 	"go.mau.fi/util/dbutil"
 	_ "go.mau.fi/util/dbutil/litestream"
 	"maunium.net/go/mautrix/bridgev2"
