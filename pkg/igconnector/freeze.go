@@ -304,8 +304,8 @@ func (ic *IGClient) checkFrozen(ctx context.Context, key networkid.PortalKey, d 
 // instead. Otherwise this is the library's default comparison.
 func frozenBackfillCheck(key networkid.PortalKey, latestTS time.Time) func(context.Context, *database.Message) (bool, error) {
 	return func(ctx context.Context, latest *database.Message) (bool, error) {
-		if _, isFrozen := frozen.since(key); isFrozen {
-			zerolog.Ctx(ctx).Debug().Msg("Not backfilling frozen chat on resync")
+		if _, isFrozen := frozen.since(key); isFrozen || deprecatedPortal(key) {
+			zerolog.Ctx(ctx).Debug().Msg("Not backfilling frozen or deprecated chat on resync")
 			return false, nil
 		}
 		if latest == nil {
@@ -316,10 +316,10 @@ func frozenBackfillCheck(key networkid.PortalKey, latestTS time.Time) func(conte
 }
 
 // frozenPortal is the backstop for frozenBackfillCheck: whatever else asks
-// for a forward backfill of a frozen chat gets nothing.
+// for a forward backfill of a frozen (or deprecated) chat gets nothing.
 func frozenPortal(key networkid.PortalKey) bool {
 	_, isFrozen := frozen.since(key)
-	return isFrozen
+	return isFrozen || deprecatedPortal(key)
 }
 
 // checkFrozenSend refuses a Matrix message sent into a frozen chat.

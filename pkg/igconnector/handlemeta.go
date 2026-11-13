@@ -313,6 +313,9 @@ func (ic *IGClient) handleDelta(ctx context.Context, d *slidetypes.Delta) (retEr
 	if ic.checkFrozen(ctx, portalKey, d) { // homestacks: frozen chats
 		return nil
 	}
+	if ic.checkDeprecated(ctx, portalKey, d) { // homestacks: deprecated chats
+		return nil
+	}
 
 	var res bridgev2.EventHandlingResult
 	switch evt := d.Data.(type) {

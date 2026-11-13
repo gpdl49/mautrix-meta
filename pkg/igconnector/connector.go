@@ -46,6 +46,7 @@ func (ic *IGConnector) Init(bridge *bridgev2.Bridge) {
 	ic.MsgConv = igconv.New(bridge, ic.DB)
 	bridge.Commands.(*commands.Processor).AddHandlers(cmdSchedule, cmdOfflineHours, cmdTimezone) // homestacks: held messages
 	bridge.Commands.(*commands.Processor).AddHandlers(cmdFreeze, cmdUnfreeze)                    // homestacks: frozen chats
+	bridge.Commands.(*commands.Processor).AddHandlers(cmdDeprecate)                              // homestacks: deprecated chats
 	ic.MsgConv.DisableViewOnce = ic.Config.DisableViewOnce
 }
 
@@ -60,6 +61,9 @@ func (ic *IGConnector) Start(ctx context.Context) error {
 	}
 	if err = ic.startFreeze(ctx); err != nil { // homestacks: frozen chats
 		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_freeze"}
+	}
+	if err = ic.startDeprecated(ctx); err != nil { // homestacks: deprecated chats
+		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_deprecate"}
 	}
 	return nil
 }

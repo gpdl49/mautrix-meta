@@ -9,7 +9,7 @@ this file first when an upstream merge conflicts.
 
 ## What the fork adds
 
-Three features, all driven from the chat's own room with the `!ig` prefix, plus one reliability fix
+Four features, all driven from the chat's own room with the `!ig` prefix, plus one reliability fix
 (connection retries, below). The features were copied from the WhatsApp fork (no shared module) and
 adapted; differences are listed at the end.
 
@@ -108,6 +108,51 @@ username to a thread; Instagram's lives in `startchat.go` and creates the chat. 
 write a read-only lookup rather than reusing the chat-starting path. A chat that was deleted while frozen
 is not handled: its next event would recreate the portal through the usual resync.
 
+### Deprecated chats
+
+A permanent, slowed-down mode for a contact you no longer want a live conversation with, ported from
+the WhatsApp fork (same rules, same code shape):
+
+```
+!ig deprecate confirm       # in the DM's room
+!ig deprecate list
+```
+
+Without `confirm` the command only explains itself. Their first message after a round ends opens a
+**batch**. It, and everything else that `freeze` would hold in that chat (their messages, reactions,
+edits, deletes, and messages you send from the app), is held for `deprecatedHoldDuration` (5 minutes).
+Then the batch is replayed in order through `handleDelta`, with the original timestamps. After that you may
+send **one** message from Matrix. Further messages are refused with the bridge's failure notice, and so is
+anything sent while a batch is held. Their next batch gives you a new reply. Reactions, edits and redactions
+from Matrix are not limited. A message you send from the app between batches uses up the reply. A failed
+send gives the reply back. An app message that arrives during a batch but was sent before the batch
+started (a late echo) does not use up that batch's reply. A newly deprecated chat whose last message is
+theirs starts with one reply.
+
+**It survives deleting the chat and cannot be turned off.** An Instagram DM's thread key *is* the other
+user's ID (`chatinfo.go` sets `OtherUserID` only when they match), so the portal key (their ID plus the
+login) is the same for every room the chat ever has. State is in `homestacks_deprecated_chat` /
+`homestacks_deprecated_event` (version table `homestacks_deprecate_version`), keyed by that. Nothing in the
+fork deletes a row, there is no undeprecate command or option, and the bridge refuses to start if the
+tables can't be loaded. Undeprecating takes a code change: add an upgrade step to `deprecateUpgrades` that
+deletes the chat's `homestacks_deprecated_chat` row (`portal_id` = their user ID, `portal_receiver` = the
+login ID) while no batch is pending (no `homestacks_deprecated_event` rows; check with `!ig deprecate list`).
+Then release a new `-hs.N`.
+
+**Forward backfill of a deprecated chat is always skipped.** `frozenBackfillCheck` and `frozenPortal` ask
+`deprecatedPortal` as well as the freeze list. A resync would otherwise bridge their messages straight from
+the server, past the batch. That includes the resync that creates the room for a brand-new chat, which
+would otherwise backfill the very message that opened the batch. The cost is that a message the socket
+never delivered (after a resnapshot) is not caught up in a deprecated chat. Instagram's media links last
+days and a batch is held for minutes, so release does not refresh media as unfreeze does.
+
+How: `checkDeprecated` runs in `handleDelta` right after `checkFrozen`. It stores the delta like freeze
+does (digest key, arrival order) and replays it with a context flag that skips the check.
+`checkDeprecatedSend` runs after `checkHold` in `HandleMatrixMessage`. It spends the reply before sending
+and returns a `refund` deferred with the handler's error, which needed `HandleMatrixMessage`'s result to be
+named. A 15-second loop releases due batches. An offline login is waited for. A delta that keeps failing is
+dropped an hour past its due time (logged at error level), so that one bad event cannot block the chat.
+
 ### Connection retries after transient failures
 
 Upstream's `connectWithRetry` retries only Meta `lserror` responses. Any other failure to load the inbox
@@ -159,9 +204,9 @@ All feature code lives in **new files**. Every hook into an upstream file is a s
 
 | Upstream file | Hook |
 |---|---|
-| `pkg/igconnector/connector.go` | two `AddHandlers` lines in `Init` (`cmdSchedule`, `cmdOfflineHours`, `cmdTimezone`; `cmdFreeze`, `cmdUnfreeze`); `startHeldMessages` and `startFreeze` guards (an `if` with a `return`) in `Start`, right after `DB.Upgrade` |
-| `pkg/igconnector/handlematrix.go` | `checkFrozenSend` then `checkHold` guards (each an `if` with a `return`) in `HandleMatrixMessage`, after the login check and before `ensureIGID` |
-| `pkg/igconnector/handlemeta.go` | `checkFrozen` guard in `handleDelta`, right after the portal is ensured; `CheckNeedsBackfillFunc` field in `wrapChatResync`, set apart by a blank line so gofmt does not re-align upstream's fields |
+| `pkg/igconnector/connector.go` | three `AddHandlers` lines in `Init` (`cmdSchedule`, `cmdOfflineHours`, `cmdTimezone`; `cmdFreeze`, `cmdUnfreeze`; `cmdDeprecate`); `startHeldMessages`, `startFreeze` and `startDeprecated` guards (an `if` with a `return`) in `Start`, right after `DB.Upgrade` |
+| `pkg/igconnector/handlematrix.go` | `HandleMatrixMessage`'s results are named (`_`, `retErr`); `checkFrozenSend` then `checkHold` guards (each an `if` with a `return`), then `checkDeprecatedSend` (assignment, `if` with a `return`, `defer refund(&retErr)`), after the login check and before `ensureIGID` |
+| `pkg/igconnector/handlemeta.go` | `checkFrozen` then `checkDeprecated` guards in `handleDelta`, right after the portal is ensured; `CheckNeedsBackfillFunc` field in `wrapChatResync`, set apart by a blank line so gofmt does not re-align upstream's fields |
 | `pkg/igconnector/backfill.go` | `frozenPortal` guard at the top of `FetchMessages` |
 | `pkg/igconnector/client.go` | `retryTransientConnectError` guard (an `if` with a `return`) at the top of the final `else` in `connectWithRetry`'s index-load error handling, before upstream's `MetaConnectError` `UNKNOWN_ERROR` |
 | `pkg/metaid/dbmeta.go` | `Timezone` field on `UserLoginMetadata`; one line in `CopyFrom` keeping it; `OfflineHours` field on `PortalMetadata` |
@@ -176,6 +221,9 @@ New files:
 | `pkg/igconnector/freeze.go` | frozen chats: guard, `homestacks_frozen_chat`/`homestacks_frozen_event` tables, replay, resync guard, media refresh |
 | `pkg/igconnector/freeze_command.go` | `!ig freeze`, `!ig unfreeze` |
 | `pkg/igconnector/freeze_test.go` | delta round trip, digest dedup and ordering, hold/skip rules, resync guard, expired-media detection |
+| `pkg/igconnector/deprecate.go` | deprecated chats: hold guard, `homestacks_deprecated_chat`/`homestacks_deprecated_event` tables, batch release loop, one-reply send guard with refund, `deprecatedPortal` for the backfill guards in `freeze.go` |
+| `pkg/igconnector/deprecate_command.go` | `!ig deprecate` (no undo, on purpose) |
+| `pkg/igconnector/deprecate_test.go` | hold decisions, delta classification, store round trip on SQLite and (with `HOMESTACKS_TEST_POSTGRES`) PostgreSQL, one reply per batch with refund |
 | `pkg/igconnector/reconnect.go` | connection retries: transient-error check, retry with backoff, full reconnect scheduled after retries run out |
 | `pkg/igconnector/reconnect_test.go` | error classification on the real error chains, short-circuit cases, cancellation of the scheduled reconnect |
 | `pkg/metaid/offlinehours.go` | `OfflineHours` type stored in portal metadata |
@@ -185,7 +233,9 @@ New files:
 ## Differences from the WhatsApp fork
 
 - Call auto-reply, call links, `!ig call` and the per-chat rate limit are **not** ported, on purpose; there
-  is no stub or config for them. So a held message's release has no rate-limit interaction.
+  is no stub or config for them. So a held message's release has no rate-limit interaction. Deprecated
+  chats carry their own one-reply rule and don't need it.
+- Deprecated chats skip forward backfill (above); `!ig deprecate` has no `+number`/@username form.
 - Held messages are paced (above); WhatsApp's loop sends every due row each pass.
 - Freeze stores Instagram `Delta` JSON, not a whatsmeow message proto, keyed by digest with arrival order.
 - Freeze has the two guards above (resync leak, expired media); WhatsApp has neither problem.
