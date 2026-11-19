@@ -89,7 +89,7 @@ func (mc *MessageConverter) ToMatrix(
 	intent bridgev2.MatrixAPI,
 	messageID networkid.MessageID,
 	msg *table.WrappedMessage,
-) *bridgev2.ConvertedMessage {
+) (*bridgev2.ConvertedMessage, error) {
 	ctx = context.WithValue(ctx, mediadl.ContextKeyFBClient, client)
 	ctx = context.WithValue(ctx, mediadl.ContextKeyIntent, intent)
 	ctx = context.WithValue(ctx, mediadl.ContextKeyUserLogin, userLogin)
@@ -99,7 +99,10 @@ func (mc *MessageConverter) ToMatrix(
 		Parts: make([]*bridgev2.ConvertedMessagePart, 0),
 	}
 	if msg.IsUnsent {
-		return cm
+		return cm, nil
+	}
+	if msg.PollID != 0 {
+		return mc.convertPoll(ctx, portal, msg)
 	}
 	// Display the thumbs-up sticker as a simple emoji message,
 	// which is the same way that it is displayed for encrypted
@@ -154,7 +157,6 @@ func (mc *MessageConverter) ToMatrix(
 			urlPreviews = append(urlPreviews, xmaAtt)
 			continue
 		} else if xmaAtt.CTA != nil && strings.HasPrefix(xmaAtt.CTA.Type_, "xma_poll_") {
-			// Skip poll metadata entirely for now
 			continue
 		}
 		cm.Parts = append(cm.Parts, mc.xmaAttachmentToMatrix(ctx, xmaAtt)...)
@@ -242,6 +244,7 @@ func (mc *MessageConverter) ToMatrix(
 			Extra: map[string]any{
 				"fi.mau.unsupported": true,
 			},
+			DontBridge: msg.IsAdminMessage,
 		})
 	}
 	if msg.ReplySourceId != "" {
@@ -256,6 +259,10 @@ func (mc *MessageConverter) ToMatrix(
 	}
 
 	for i, part := range cm.Parts {
+		if part.DBMetadata == nil {
+			part.DBMetadata = &metaid.MessageMetadata{}
+		}
+		part.DBMetadata.(*metaid.MessageMetadata).FBThreadKey = msg.ThreadKey
 		// If part ID is already assigned, use the one that is given, as some code paths
 		// above generate message fragments with specific part IDs so that media can refer
 		// to those part IDs. Otherwise, assign a sequential integer. It is okay to my
@@ -272,10 +279,10 @@ func (mc *MessageConverter) ToMatrix(
 				threadURL = fmt.Sprintf("https://www.instagram.com/direct/t/%s/", portal.ID)
 				protocolName = "Instagram"
 			} else if client.GetPlatform().IsViaFacebook() {
-				threadURL = fmt.Sprintf("https://www.facebook.com/messages/t/%s/", portal.ID)
+				threadURL = fmt.Sprintf("https://www.facebook.com/messages/t/%d/", msg.ThreadKey)
 				protocolName = "Facebook"
 			} else if client.GetPlatform().IsViaMessenger() {
-				threadURL = fmt.Sprintf("https://www.messenger.com/t/%s/", portal.ID)
+				threadURL = fmt.Sprintf("https://www.messenger.com/t/%d/", msg.ThreadKey)
 				protocolName = "Messenger"
 			}
 			if threadURL != "" {
@@ -295,7 +302,7 @@ func (mc *MessageConverter) ToMatrix(
 		// exactly one item in the slice and it is the media part ID.
 		cm.Parts[0].ID = importantPartIDs[0]
 	}
-	return cm
+	return cm, nil
 }
 
 func errorToNotice(err error, attachmentContainerType string) *bridgev2.ConvertedMessagePart {
@@ -511,23 +518,30 @@ func (mc *MessageConverter) xmaAttachmentToMatrix(ctx context.Context, att *tabl
 	if att.CTA != nil && att.CTA.Type_ == "xma_live_location_sharing" {
 		return []*bridgev2.ConvertedMessagePart{mc.xmaLocationToMatrix(ctx, att)}
 	}
+	if isXMACallLog(att) {
+		return []*bridgev2.ConvertedMessagePart{xmaCallLogToMatrix(att)}
+	}
 	url := att.PlayableUrl
 	mime := att.PlayableUrlMimeType
+	expiresAt := att.PlayableUrlExpirationTimestampMs
 	var width, height int64
 	if url == "" {
 		url = att.PreviewUrl
 		mime = att.PreviewUrlMimeType
 		width, height = att.PreviewWidth, att.PreviewHeight
+		expiresAt = att.PreviewUrlExpirationTimestampMs
 	}
 	// Slightly hacky hack to make reuploadAttachment add gif metadata if the shouldAutoplayVideo flag is set.
 	// No idea why Instagram has two different ways of flagging gifs.
 	if att.ShouldAutoplayVideo {
 		att.AttachmentType = table.AttachmentTypeAnimatedImage
 	}
-	// This is minimal conversion; fetchFullXMA will enhance with proper refresh metadata
 	converted, err := mc.reuploadAttachment(
 		ctx, att.AttachmentType, url, att.Filename, mime, int(att.Filesize), int(width), int(height), 0,
-		nil,
+		&mediadl.MediaRefreshMeta{
+			ExpiresAt:      jsontime.UMInt(expiresAt),
+			AttachmentFBID: att.AttachmentFbid,
+		},
 	)
 	if errors.Is(err, mediadl.ErrURLNotFound) && att.TitleText != "" {
 		return []*bridgev2.ConvertedMessagePart{{
@@ -691,4 +705,36 @@ func (mc *MessageConverter) reuploadAttachment(
 		DirectMedia:    mc.DirectMedia,
 		MaxFileSize:    mc.MaxFileSize,
 	})
+}
+
+func xmaCallLogToMatrix(att *table.WrappedXMA) *bridgev2.ConvertedMessagePart {
+	callType := event.BeeperActionMessageCallTypeVoice
+	if strings.Contains(att.CTA.Type_, "video") {
+		callType = event.BeeperActionMessageCallTypeVideo
+	}
+	body := att.TitleText
+	if body == "" {
+		body = "Audio call"
+		if callType == event.BeeperActionMessageCallTypeVideo {
+			body = "Video call"
+		}
+		if strings.Contains(att.CTA.Type_, "_missed_") {
+			body = "Missed " + strings.ToLower(body)
+		}
+	}
+	return &bridgev2.ConvertedMessagePart{
+		Type: event.EventMessage,
+		Content: &event.MessageEventContent{
+			MsgType: event.MsgText,
+			Body:    body,
+			BeeperActionMessage: &event.BeeperActionMessage{
+				Type:     event.BeeperActionMessageCall,
+				CallType: callType,
+			},
+		},
+	}
+}
+
+func isXMACallLog(att *table.WrappedXMA) bool {
+	return att.CTA != nil && strings.HasPrefix(att.CTA.Type_, "xma_rtc_")
 }

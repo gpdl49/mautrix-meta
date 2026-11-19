@@ -19,6 +19,7 @@ import (
 type MessengerHistoryLogin struct {
 	historyComplete *bridgev2.LoginStep
 	historyBackup   *securehistory.Backup
+	historyRestored bool
 }
 
 var historyPINPattern = regexp.MustCompile(`^[0-9]{6}$`)
@@ -49,15 +50,13 @@ func historyPINStep(message string) *bridgev2.LoginStep {
 func (m *MessengerHistoryLogin) startHistory(ctx context.Context, complete *bridgev2.LoginStep) (*bridgev2.LoginStep, error) {
 	m.historyComplete = complete
 	client := complete.CompleteParams.UserLogin.Client.(*MetaClient)
-	if !client.LoginMeta.Platform.IsMessenger() {
+	if client.canBackfillEncrypted() || !client.Main.Config.E2EEBackfill {
 		return complete, nil
-	}
-	if client.canBackfillEncrypted() {
-		return m.finishHistory(ctx)
 	}
 	var err error
 	m.historyBackup, err = client.Client.GetSecureHistoryClient().GetBackup(ctx)
 	if errors.Is(err, securehistory.ErrNoPINBackup) {
+		client.UserLogin.Log.Info().Msg("Messenger account has no encrypted history backup")
 		return complete, nil
 	} else if err != nil {
 		client.UserLogin.Log.Warn().Err(err).Msg("Failed to check Messenger encrypted history")
@@ -66,6 +65,7 @@ func (m *MessengerHistoryLogin) startHistory(ctx context.Context, complete *brid
 		}
 		return historyPINStep("Couldn't check your saved history. Enter your PIN to try again, or leave it empty to continue."), nil
 	}
+	client.UserLogin.Log.Info().Msg("Found Messenger encrypted history backup, asking for PIN")
 	return historyPINStep(""), nil
 }
 
@@ -111,9 +111,12 @@ func (m *MessengerHistoryLogin) finishHistory(ctx context.Context) (*bridgev2.Lo
 			client.UserLogin.Log.Warn().Err(err).Msg("Failed to save Messenger history enrollment")
 			return historyPINStep("Couldn't save history setup. Leave the PIN empty to retry saving it."), nil
 		}
-		if err := client.queueEncryptedBackfill(ctx); err != nil {
-			client.UserLogin.Log.Warn().Err(err).Msg("Failed to queue Messenger encrypted history")
-			return historyPINStep("Couldn't queue your saved history. Leave the PIN empty to try again."), nil
+		if m.historyRestored {
+			if err := client.queueEncryptedBackfill(ctx); err != nil {
+				client.UserLogin.Log.Warn().Err(err).Msg("Failed to queue Messenger encrypted history")
+				return historyPINStep("Couldn't queue your saved history. Leave the PIN empty to try again."), nil
+			}
+			m.historyRestored = false
 		}
 	}
 	return m.historyComplete, nil
@@ -173,8 +176,10 @@ func (m *MessengerHistoryLogin) restoreHistory(ctx context.Context, client *Meta
 		}
 		return err
 	}
+	client.UserLogin.Log.Info().Str("history_device_id", device.ID).Msg("Enrolled Messenger encrypted history device")
 	client.backfillLock.Lock()
 	client.LoginMeta.HistoryDevice = device
+	m.historyRestored = true
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	err = client.UserLogin.Save(saveCtx)

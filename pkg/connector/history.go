@@ -3,11 +3,13 @@ package connector
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strconv"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow/types"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -28,6 +30,9 @@ func (m *MetaClient) historyDevice() *securehistory.Device {
 }
 
 func (m *MetaClient) canBackfillEncrypted() bool {
+	if !m.Main.Config.E2EEBackfill {
+		return false
+	}
 	device := m.historyDevice()
 	return device != nil && device.ID != ""
 }
@@ -69,15 +74,67 @@ func (m *MetaClient) queueEncryptedBackfill(ctx context.Context) error {
 		} else if portal == nil || portal.MXID == "" || !portal.Metadata.(*metaid.PortalMetadata).ThreadType.IsWhatsApp() {
 			continue
 		}
-		if err = m.Main.Bridge.DB.BackfillTask.EnsureExists(ctx, portal.PortalKey, m.UserLogin.ID); err != nil {
+		reopened, err := m.resetMessengerBackfill(ctx, portal.PortalKey)
+		if err != nil {
 			return err
-		}
-		if err = m.Main.Bridge.DB.BackfillTask.MarkNotDone(ctx, portal.PortalKey, m.UserLogin.ID); err != nil {
-			return err
+		} else if !reopened {
+			continue
 		}
 		m.Main.Bridge.WakeupBackfillQueue(&bridgev2.ManualBackfill{Source: m.UserLogin, Portal: portal})
 	}
 	return nil
+}
+
+type messengerHistoryCursor struct {
+	Timestamp    int64  `json:"timestamp,omitempty"`
+	OpenThreadID int64  `json:"open_thread_id,omitempty"`
+	MessageID    string `json:"message_id,omitempty"`
+}
+
+func (m *MetaClient) fetchMixedHistory(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
+	if !m.canBackfillEncrypted() || params.ThreadRoot != "" {
+		return nil, nil
+	} else if params.Forward {
+		return m.fetchEncryptedHistory(ctx, params)
+	}
+	var cursor messengerHistoryCursor
+	if params.Cursor != "" {
+		if err := json.Unmarshal([]byte(params.Cursor), &cursor); err != nil {
+			return nil, fmt.Errorf("invalid Messenger history cursor: %w", err)
+		}
+	}
+	openThreadID, err := m.Main.DB.GetOpenThreadKey(ctx, m.UserLogin.ID, metaid.ParseFBPortalID(params.Portal.ID))
+	if err != nil {
+		return nil, err
+	}
+	if cursor.OpenThreadID != 0 {
+		if cursor.OpenThreadID != openThreadID {
+			return nil, fmt.Errorf("history predecessor changed")
+		}
+		return m.fetchFacebookHistory(ctx, params, openThreadID, &cursor)
+	}
+	params.Cursor = ""
+	if cursor.Timestamp != 0 {
+		params.Cursor = networkid.PaginationCursor(strconv.FormatInt(cursor.Timestamp, 10))
+	}
+	response, err := m.fetchEncryptedHistory(ctx, params)
+	if err != nil || response == nil {
+		return response, err
+	}
+	cursor.Timestamp, err = strconv.ParseInt(string(response.Cursor), 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	if !response.HasMore && openThreadID != 0 {
+		cursor = messengerHistoryCursor{OpenThreadID: openThreadID}
+		response.HasMore = true
+	}
+	encoded, err := json.Marshal(cursor)
+	if err != nil {
+		return nil, err
+	}
+	response.Cursor = networkid.PaginationCursor(encoded)
+	return response, nil
 }
 
 func (m *MetaClient) fetchEncryptedHistory(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
@@ -87,15 +144,15 @@ func (m *MetaClient) fetchEncryptedHistory(ctx context.Context, params bridgev2.
 	}
 	timestamp := time.Now().Add(time.Minute).UnixMilli()
 	if !params.Forward {
-		if params.AnchorMessage != nil {
-			timestamp = params.AnchorMessage.Timestamp.UnixMilli()
-		}
 		if params.Cursor != "" {
 			var err error
 			timestamp, err = strconv.ParseInt(string(params.Cursor), 10, 64)
 			if err != nil {
 				return nil, fmt.Errorf("invalid Messenger history cursor: %w", err)
 			}
+		}
+		if params.AnchorMessage != nil {
+			timestamp = min(timestamp, params.AnchorMessage.Timestamp.UnixMilli())
 		}
 	}
 	chat := params.Portal.Metadata.(*metaid.PortalMetadata).JID(params.Portal.ID)
@@ -117,15 +174,13 @@ func (m *MetaClient) fetchEncryptedHistory(ctx context.Context, params bridgev2.
 		HasMore:  *page.Range.HasMoreBefore,
 		Forward:  params.Forward,
 	}
-	messages, err := page.Decrypt(device, chat.User, metaid.ParseUserLoginID(m.UserLogin.ID), chat.Server == types.GroupServer)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt Messenger history: %w", err)
-	}
+	messages := page.Decrypt(ctx, device, chat.User, metaid.ParseUserLoginID(m.UserLogin.ID), chat.Server == types.GroupServer)
 	var newestTimestamp int64
 	for _, message := range messages {
 		converted, err := m.convertArchiveMessage(ctx, params.Portal, message)
 		if err != nil {
-			return nil, err
+			zerolog.Ctx(ctx).Warn().Err(err).Str("message_id", message.ID).Msg("Failed to convert Messenger archive message")
+			continue
 		} else if converted != nil {
 			response.Messages = append(response.Messages, converted)
 		}
@@ -137,6 +192,9 @@ func (m *MetaClient) fetchEncryptedHistory(ctx context.Context, params bridgev2.
 	if (params.Forward || params.AnchorMessage == nil) && len(response.Messages) > 0 {
 		readState, _ := m.historyReadStates.Get(metaid.ParseFBPortalID(params.Portal.ID))
 		response.MarkRead = readState.lastActivity > 0 && readState.readWatermark >= max(readState.lastActivity, newestTimestamp)
+		if !response.MarkRead && readState.readWatermark > 0 {
+			response.ReadUpTo = time.UnixMilli(readState.readWatermark)
+		}
 	}
 	return response, nil
 }

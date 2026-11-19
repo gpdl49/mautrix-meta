@@ -2,7 +2,6 @@ package connector
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -75,82 +74,10 @@ func (m *MetaConnector) CreateLogin(ctx context.Context, user *bridgev2.User, fl
 	}, nil
 }
 
-type metaCredentials struct {
-	Platform      types.Platform       `json:"platform"`
-	Cookies       *cookies.Cookies     `json:"cookies"`
-	NativeSession *types.NativeSession `json:"native_session,omitempty"`
-}
-
 func validateNativeSession(session *types.NativeSession) error {
-	if session != nil && (session.AccessToken == "" || session.AppID != useragent.MessengerLiteAndroidAppID || session.DeviceID == uuid.Nil || session.FamilyDeviceID == uuid.Nil) {
+	if session != nil && (session.AccessToken == "" || (session.AppID != useragent.MessengerLiteAndroidAppID && session.AppID != useragent.MessengerLiteIOSAppID) || session.DeviceID == uuid.Nil || session.FamilyDeviceID == uuid.Nil) {
 		return fmt.Errorf("invalid native Messenger session")
 	}
-	return nil
-}
-
-func (m *MetaConnector) CreateUserLoginFromCredentials(ctx context.Context, user *bridgev2.User, credentials any) error {
-	creds, ok := credentials.(map[string]any)
-	if !ok {
-		return fmt.Errorf("invalid credentials type: %T", credentials)
-	}
-	var transferred metaCredentials
-	if _, structured := creds["cookies"]; structured {
-		data, err := json.Marshal(creds)
-		if err != nil {
-			return fmt.Errorf("failed to encode transferred credentials: %w", err)
-		} else if err = json.Unmarshal(data, &transferred); err != nil {
-			return fmt.Errorf("failed to decode transferred credentials: %w", err)
-		} else if transferred.Cookies == nil || !transferred.Platform.IsMessenger() {
-			return fmt.Errorf("invalid transferred Messenger credentials")
-		} else if err = validateNativeSession(transferred.NativeSession); err != nil {
-			return err
-		}
-		transferred.Cookies.Platform = transferred.Platform
-	} else {
-		transferred.Platform = types.Facebook
-		if m.Config.Tor {
-			transferred.Platform = types.FacebookTor
-		}
-		transferred.Cookies = &cookies.Cookies{Platform: transferred.Platform}
-		values := make(map[cookies.MetaCookieName]string, len(creds))
-		for key, value := range creds {
-			str, ok := value.(string)
-			if !ok {
-				return fmt.Errorf("invalid cookie value type for %s", key)
-			}
-			values[cookies.MetaCookieName(key)] = str
-		}
-		transferred.Cookies.UpdateValues(values)
-	}
-	log := zerolog.Ctx(ctx).With().Str("component", "messagix").Logger()
-	if session := transferred.NativeSession; session != nil {
-		authClient, err := getMessagixClient(log, m, &cookies.Cookies{Platform: types.MessengerLiteAndroid}, m.Config.ProxyMessengerLite)
-		if err != nil {
-			return err
-		}
-		session.DeviceID = uuid.New()
-		authClient.MessengerLite.SetNativeSession(session)
-		newCookies, err := authClient.MessengerLite.ExchangeTransientToken(ctx, session.AccessToken)
-		if err != nil {
-			return fmt.Errorf("failed to create transferred native session: %w", err)
-		} else if newCookies.GetUserID() != transferred.Cookies.GetUserID() {
-			return fmt.Errorf("exchanged native session account does not match login")
-		}
-		newCookies.Platform = transferred.Platform
-		transferred.Cookies = newCookies
-		transferred.NativeSession = authClient.MessengerLite.GetNativeSession()
-	}
-	client, err := getMessagixClient(log, m, transferred.Cookies, m.Config.ProxyOther)
-	if err != nil {
-		return err
-	}
-	step, err := loginWithCookies(ctx, log, client, user, m, transferred.Cookies, transferred.NativeSession)
-	if err != nil {
-		return err
-	} else if step.Type != bridgev2.LoginStepTypeComplete {
-		return fmt.Errorf("expected complete step from credential login, got: %s", step.Type)
-	}
-
 	return nil
 }
 
@@ -417,7 +344,7 @@ func (m *MetaNativeLogin) CancelStep(ctx context.Context) (*bridgev2.LoginStep, 
 		return m.finishHistory(ctx)
 	}
 	if err := m.SavedClient.MessengerLite.CancelLoginStep(ctx); err != nil {
-		return nil, err
+		return nil, wrapMetaRespError(err)
 	}
 	return m.proceed(ctx, nil)
 }
@@ -430,6 +357,8 @@ func (m *MetaNativeLogin) proceed(ctx context.Context, userInput map[string]stri
 		log.Error().Err(err).Msg("Login steps returned error")
 		if errors.As(err, &bloks.CheckpointError{}) {
 			err = loginerrors.Checkpoint
+		} else if httpclient.IsClientHTTPError(err) {
+			err = loginerrors.ClientHTTPFailed.WithInternalError(err)
 		}
 		return nil, err
 	}

@@ -6,6 +6,7 @@ type GraphQLDoc struct {
 	CallerClass  string
 	FriendlyName string
 	NoRetry      bool
+	SlowQuery    bool
 
 	Jsessw string
 }
@@ -26,6 +27,14 @@ var GraphQLDocs = map[string]GraphQLDoc{
 	"EBMessageRangeQueryForThreadsQuery": {
 		DocID:        "28543107645309813",
 		FriendlyName: "EBMessageRangeQueryForThreadsQuery",
+	},
+	"EBMinosFetchContactKeysQuery": {
+		DocID:        "26531892553066563",
+		FriendlyName: "EBMinosFetchContactKeysQuery",
+	},
+	"EBMinosUploadMessagesMutation": {
+		DocID:        "39866297732983438",
+		FriendlyName: "EBMinosUploadMessagesMutation",
 	},
 	"useMWEncryptedBackupsFetchBackupIdsV2Query": {
 		DocID:        "25220416984279164",
@@ -48,10 +57,12 @@ var GraphQLDocs = map[string]GraphQLDoc{
 	"LSPlatformGraphQLLightspeedRequestQuery": {
 		DocID:        "9697184873702141",
 		FriendlyName: "LSPlatformGraphQLLightspeedRequestQuery",
+		SlowQuery:    true,
 	},
 	"LSPlatformGraphQLLightspeedRequestForIGDQuery": {
 		DocID:        "6195354443842040",
 		FriendlyName: "LSPlatformGraphQLLightspeedRequestForIGDQuery",
+		SlowQuery:    true,
 	},
 	"MAWCatQuery": {
 		DocID:        "29559957360285299",
@@ -88,11 +99,11 @@ var GraphQLDocs = map[string]GraphQLDoc{
 		FriendlyName: "PolarisDirectMessageRequestQuery",
 	},
 	"IGDirectUpdateThreadImageMutation": {
-		ClientDocID:  "5576567352987267181917649770",
+		ClientDocID:  "55765673517595645442718111522",
 		FriendlyName: "IGDirectUpdateThreadImageMutation",
 	},
 	"IGDirectRemoveThreadImageMutation": {
-		ClientDocID:  "50027745118339199321503686240",
+		ClientDocID:  "50027745113490480796280284264",
 		FriendlyName: "IGDirectRemoveThreadImageMutation",
 	},
 	"PolarisDirectInboxQuery": {

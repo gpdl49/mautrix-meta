@@ -60,11 +60,16 @@ func (c *Client) connectStreamController(ctx context.Context) {
 			sock.Log.Warn().Err(err).
 				Int("sequential_failures", sequentialFailures).
 				Msg("Connection failed, reconnecting...")
+			if c.cookies.IsLoggedIn() && !c.IsAuthenticated() {
+				if _, reloadErr := c.ReloadIndex(ctx); reloadErr != nil {
+					sock.Log.Err(reloadErr).Msg("Failed to reload index for typing stream without logged-in viewer")
+				}
+			}
 			select {
 			case <-ctx.Done():
 				sock.Log.Debug().Msg("Context canceled, stopping socket reconnect attempts")
 				return
-			case <-time.After(min(time.Duration(1<<sequentialFailures)*time.Second, MaxConnectionRetryInterval)):
+			case <-time.After(min(time.Duration(1<<min(sequentialFailures, 10))*time.Second, MaxConnectionRetryInterval)):
 				continue
 			}
 		} else {

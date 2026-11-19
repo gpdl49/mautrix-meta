@@ -4,7 +4,6 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/json"
-	"sync/atomic"
 
 	"go.mau.fi/util/exerrors"
 	"go.mau.fi/util/random"
@@ -19,6 +18,7 @@ import (
 )
 
 type MessageMetadata struct {
+	FBThreadKey   int64 `json:"fb_thread_key,omitempty"`
 	EditTimestamp int64 `json:"edit_timestamp,omitempty"`
 	// Default direct media meta. Used for blob media, whatsapp media and old XMA media
 	DirectMediaMeta json.RawMessage `json:"direct_media_meta,omitempty"`
@@ -27,6 +27,29 @@ type MessageMetadata struct {
 	// Metadata for postponed fetching of XMA media.
 	XMAFetchMeta *XMAFetchMeta `json:"xma_fetch_meta,omitempty"`
 	XMAFetched   bool          `json:"xma_fetched,omitempty"`
+
+	PollID        int64              `json:"poll_id,omitzero"`
+	PollQuestion  string             `json:"poll_question,omitempty"`
+	PollAnswers   []table.PollOption `json:"poll_answers,omitempty"`
+	PollOptions   map[string]int64   `json:"poll_options,omitempty"`
+	PollVotes     map[int64]PollVote `json:"poll_votes,omitempty"`
+	PollFetched   bool               `json:"poll_fetched,omitzero"`
+	PollUpdatedMS int64              `json:"poll_updated_ms,omitzero"`
+	PollResponse  bool               `json:"poll_response,omitzero"`
+
+	DecryptionFailed bool `json:"decryption_failed,omitempty"`
+}
+
+type PollVote struct {
+	OptionIDs   []int64 `json:"option_ids"`
+	TimestampMS int64   `json:"timestamp_ms"`
+}
+
+func (m *MessageMetadata) GetFBThreadKey(portalID networkid.PortalID) int64 {
+	if m.FBThreadKey != 0 {
+		return m.FBThreadKey
+	}
+	return ParseFBPortalID(portalID)
 }
 
 type XMAFetchMeta struct {
@@ -53,7 +76,9 @@ type UserLoginMetadata struct {
 	HistoryDevice          *securehistory.Device         `json:"history_device,omitempty"`
 
 	// Thread backfill state
-	BackfillCompleted bool `json:"backfill_completed,omitempty"`
+	BackfillCompleted     bool   `json:"backfill_completed,omitempty"`
+	E2EEBackfillCompleted bool   `json:"e2ee_backfill_completed,omitempty"`
+	ThreadBackfillCursor  string `json:"thread_backfill_cursor,omitempty"`
 }
 
 func (m *UserLoginMetadata) CopyFrom(other any) {
@@ -86,8 +111,6 @@ type PortalMetadata struct {
 	IGThreadID string `json:"ig_thread_id,omitempty"`
 
 	EphemeralSettingTimestamp int64 `json:"ephemeral_setting_timestamp,omitempty"`
-
-	FetchAttempted atomic.Bool `json:"-"`
 }
 
 func (meta *PortalMetadata) JID(id networkid.PortalID) waTypes.JID {

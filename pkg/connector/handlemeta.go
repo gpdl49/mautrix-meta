@@ -2,7 +2,9 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"net/url"
+	"slices"
 	"time"
 
 	"github.com/coder/websocket"
@@ -35,6 +37,7 @@ const (
 	MetaRedirectedToLoginPage status.BridgeStateErrorCode = "meta-redirected-to-login"
 	MetaNotLoggedIn           status.BridgeStateErrorCode = "meta-not-logged-in"
 	MetaConnectError          status.BridgeStateErrorCode = "meta-connect-error"
+	MetaInboxLoadFailed       status.BridgeStateErrorCode = "meta-inbox-load-failed"
 	MetaGraphQLError          status.BridgeStateErrorCode = "meta-graphql-error"
 	MetaTransientDisconnect   status.BridgeStateErrorCode = "meta-transient-disconnect"
 	FBChallengeRequired       status.BridgeStateErrorCode = "fb-challenge-required"
@@ -48,6 +51,7 @@ const (
 func init() {
 	status.BridgeStateHumanErrors.Update(status.BridgeStateErrorMap{
 		WADisconnected:            "Disconnected from encrypted chat server. Trying to reconnect.",
+		WAConnectError:            "Failed to connect to encrypted chat server",
 		MetaTransientDisconnect:   "Disconnected from server, trying to reconnect",
 		DGWConnectionUnauthorized: "Logged out, please relogin to continue",
 		MetaCookieRemoved:         "Logged out, please relogin to continue",
@@ -59,6 +63,8 @@ func init() {
 		FBConsentRequired:         "Consent required, please check the Facebook website to continue",
 		FBCheckpointRequired:      "Checkpoint required, please check the Facebook website to continue",
 		MetaConnectError:          "Unknown connection error",
+		MetaInboxLoadFailed:       "Facebook keeps failing to load your messages",
+		MetaPermanentError:        "Unknown permanent connection error",
 		MetaProxyUpdateFail:       "Failed to update proxy",
 		IGNotSupported:            "This bridge no longer supports Instagram",
 	})
@@ -78,10 +84,12 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 		log.Debug().Msg("Initial connect to Meta socket completed")
 		m.permanentErrored.Store(false)
 		m.connectWaiter.Set()
+		m.requestedThreads.Clear()
+		m.retryPendingPolls(ctx)
 		m.firstE2EEConnectDone = true
 		go m.tryConnectE2EE(false)
 		m.metaState = status.BridgeState{StateEvent: status.StateConnected}
-		m.UserLogin.BridgeState.Send(m.metaState)
+		m.sendBridgeState(m.metaState)
 		if tbl := m.initialTable.Swap(nil); tbl != nil {
 			log.Debug().Msg("Handling cached initial table")
 			m.parseAndQueueTable(ctx, tbl, true)
@@ -95,11 +103,19 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 	case *messagix.TransientDisconnectEvent:
 		log.Debug().Err(evt.Err).Msg("Disconnected from Meta socket")
 		m.connectWaiter.Clear()
-		m.metaState = status.BridgeState{
-			StateEvent: status.StateTransientDisconnect,
-			Error:      MetaTransientDisconnect,
+		if m.metaState.StateEvent != status.StateBadCredentials {
+			m.metaState = status.BridgeState{
+				StateEvent: status.StateTransientDisconnect,
+				Error:      MetaTransientDisconnect,
+			}
+			m.sendBridgeState(m.metaState)
 		}
-		m.UserLogin.BridgeState.Send(m.metaState)
+		if errors.Is(evt.Err, messagix.ErrFatalSocketSyncError) && m.canReconnect() {
+			// Retrying the socket reuses the sync state from the last page load, so it
+			// keeps failing the same way until the page is loaded again.
+			log.Debug().Msg("Doing full reconnect after failing to sync database 1")
+			go m.FullReconnect()
+		}
 	case *messagix.ReconnectedEvent:
 		if !m.firstE2EEConnectDone {
 			m.firstE2EEConnectDone = true
@@ -107,25 +123,29 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 		}
 		log.Debug().Msg("Reconnected to Meta socket")
 		m.connectWaiter.Set()
-		m.metaState = status.BridgeState{StateEvent: status.StateConnected}
-		m.UserLogin.BridgeState.Send(m.metaState)
+		m.requestedThreads.Clear()
+		m.retryPendingPolls(ctx)
+		if m.metaState.StateEvent != status.StateBadCredentials {
+			m.metaState = status.BridgeState{StateEvent: status.StateConnected}
+			m.sendBridgeState(m.metaState)
+		}
 	case *messagix.PermanentErrorEvent:
 		// TODO do full reconnect in some cases?
-		m.permanentErrored.Store(true)
 		if websocket.CloseStatus(evt.Err) == dgw.CloseStatusUnauthorized {
+			m.permanentErrored.Store(true)
 			m.metaState = status.BridgeState{
 				StateEvent: status.StateBadCredentials,
 				Error:      DGWConnectionUnauthorized,
-				Message:    evt.Err.Error(),
+				Info:       map[string]any{"go_error": evt.Err.Error()},
 			}
 		} else {
 			m.metaState = status.BridgeState{
 				StateEvent: status.StateUnknownError,
 				Error:      MetaPermanentError,
-				Message:    evt.Err.Error(),
+				Info:       map[string]any{"go_error": evt.Err.Error()},
 			}
 		}
-		m.UserLogin.BridgeState.Send(m.metaState)
+		m.sendBridgeState(m.metaState)
 		if stopPeriodicReconnect := m.stopPeriodicReconnect.Swap(nil); stopPeriodicReconnect != nil {
 			(*stopPeriodicReconnect)()
 		}
@@ -252,6 +272,11 @@ func (m *MetaClient) syncGhost(ctx context.Context, info types.UserInfo) {
 }
 
 func (m *MetaClient) parseTable(ctx context.Context, tbl *table.LSTable) (innerQueue []bridgev2.RemoteEvent) {
+	for _, cutover := range tbl.LSCreateOpenToE2EEThreadLink {
+		if err := m.storeThreadCutover(ctx, cutover); err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to persist thread cutover mapping")
+		}
+	}
 	threadExists := make(map[int64]*table.LSVerifyThreadExists, len(tbl.LSVerifyThreadExists))
 	threadResyncs := make(map[int64]*FBChatResync, len(tbl.LSDeleteThenInsertThread))
 	folderResyncs := make(map[int64]*FBFolderResync, len(tbl.LSUpsertFolder))
@@ -400,6 +425,12 @@ func (m *MetaClient) parseTable(ctx context.Context, tbl *table.LSTable) (innerQ
 	collectPortalEvents(params, tbl.LSUpdateThreadMuteSetting, m.handleUpdateMuteSetting, &innerQueue)
 	collectPortalEvents(params, tbl.LSMoveThreadToE2EECutoverFolder, m.handleMoveThreadToE2EE, &innerQueue)
 	upsert, insert := tbl.WrapMessages()
+	insert = slices.DeleteFunc(insert, m.handlePendingPoll)
+	for _, data := range tbl.WrapPollData() {
+		if evt := m.wrapPollSnapshot(data); evt != nil {
+			innerQueue = append(innerQueue, evt)
+		}
+	}
 	collectPortalEvents(params, maps.Values(upsert), m.handleUpsertMessages, &innerQueue)
 	collectPortalEvents(params, tbl.LSUpdateExistingMessageRange, m.handleUpdateExistingMessageRange, &innerQueue)
 
@@ -468,6 +499,7 @@ func (m *MetaClient) parseTable(ctx context.Context, tbl *table.LSTable) (innerQ
 }
 
 func (m *MetaClient) handleMarkThreadRead(tk handlerParams, msg *table.LSMarkThreadReadV2) bridgev2.RemoteEvent {
+	m.mapPersistedHybridThread(&tk, msg.ThreadKey)
 	return &simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type: bridgev2.RemoteEventReadReceipt,
@@ -483,6 +515,7 @@ func (m *MetaClient) handleMarkThreadRead(tk handlerParams, msg *table.LSMarkThr
 }
 
 func (m *MetaClient) handleUpdateReadReceipt(tk handlerParams, msg *table.LSUpdateReadReceipt) bridgev2.RemoteEvent {
+	m.mapPersistedHybridThread(&tk, msg.ThreadKey)
 	// Only set timestamp if Instagram provides a valid one
 	var timestamp time.Time
 	if msg.ReadActionTimestampMs > 0 {
@@ -598,18 +631,23 @@ func (m *MetaClient) handleDeleteThread(tk handlerParams, msg *table.LSDeleteThr
 }
 
 func (m *MetaClient) handleDeletePartialThread(tk handlerParams, msg *table.LSDeletePartialThread) bridgev2.RemoteEvent {
-	if tk.Type == table.UNKNOWN_THREAD_TYPE {
-		threadJID, threadType, err := m.Main.DB.GetHybridThreadJID(tk.ctx, m.UserLogin.ID, msg.ThreadKey)
-		if err != nil {
-			zerolog.Ctx(tk.ctx).Warn().Err(err).Int64("thread_key", msg.ThreadKey).
-				Msg("Failed to get persisted hybrid thread mapping")
-		} else if threadJID != 0 {
-			tk.ID = threadJID
-			tk.Type = table.ThreadType(threadType)
-			tk.Portal = m.makeFBPortalKey(threadJID, tk.Type)
-		}
-	}
+	m.mapPersistedHybridThread(&tk, msg.ThreadKey)
 	return m.handleDeleteThreadKey(tk, tk.ID, true /* OnlyForMe */)
+}
+
+func (m *MetaClient) mapPersistedHybridThread(tk *handlerParams, threadKey int64) {
+	if tk.Type != table.UNKNOWN_THREAD_TYPE {
+		return
+	}
+	threadJID, threadType, err := m.Main.DB.GetHybridThreadJID(tk.ctx, m.UserLogin.ID, threadKey)
+	if err != nil {
+		zerolog.Ctx(tk.ctx).Warn().Err(err).Int64("thread_key", threadKey).
+			Msg("Failed to get persisted hybrid thread mapping")
+	} else if threadJID != 0 {
+		tk.ID = threadJID
+		tk.Type = table.ThreadType(threadType)
+		tk.Portal = m.makeFBPortalKey(threadJID, tk.Type)
+	}
 }
 
 func (m *MetaClient) handleDeleteMessageRequest(tk handlerParams, msg *table.LSDeleteMessageRequest) bridgev2.RemoteEvent {
