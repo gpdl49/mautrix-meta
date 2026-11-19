@@ -342,6 +342,12 @@ func (ic *IGClient) connectWithRetry(retryCtx, ctx context.Context, attempts int
 				Error:      MetaGraphQLError,
 				Message:    gqlErr.Message,
 			})
+		} else if attempts < MaxConnectRetries && errors.Is(err, httpclient.ErrMaxRetriesReached) {
+			ic.UserLogin.BridgeState.Send(status.BridgeState{
+				StateEvent: status.StateTransientDisconnect,
+				Error:      MetaConnectError,
+			})
+			ic.connectWithRetry(retryCtx, ctx, attempts+1)
 		} else {
 			ic.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateUnknownError,
