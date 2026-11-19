@@ -133,21 +133,10 @@ func (ic *IGClient) ensureIGID(ctx context.Context, portal *bridgev2.Portal) (*m
 	return meta, nil
 }
 
-func (ic *IGClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (_ *bridgev2.MatrixMessageResponse, retErr error) { // homestacks: named error for deprecated chats
+func (ic *IGClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	if ic.LoginMeta.Cookies == nil {
 		return nil, bridgev2.ErrNotLoggedIn
 	}
-	if err := ic.checkFrozenSend(msg.Portal); err != nil { // homestacks: frozen chats
-		return nil, err
-	}
-	if err := ic.checkHold(ctx, msg); err != nil { // homestacks: held messages
-		return nil, err
-	}
-	refund, deprecatedErr := ic.checkDeprecatedSend(ctx, msg.Portal) // homestacks: deprecated chats
-	if deprecatedErr != nil {                                        // homestacks: deprecated chats
-		return nil, deprecatedErr
-	}
-	defer refund(&retErr) // homestacks: deprecated chats
 	_, err := ic.ensureIGID(ctx, msg.Portal)
 	if errors.Is(err, instameow.ErrThreadNotFound) && msg.Content.MsgType == event.MsgText && msg.Portal.RoomType == database.RoomTypeDM {
 		// Allow sending text DMs even if the thread isn't known

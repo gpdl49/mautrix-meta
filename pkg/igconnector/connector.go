@@ -20,7 +20,6 @@ import (
 	"context"
 
 	"maunium.net/go/mautrix/bridgev2"
-	"maunium.net/go/mautrix/bridgev2/commands"
 
 	"go.mau.fi/mautrix-meta/pkg/metadb"
 	"go.mau.fi/mautrix-meta/pkg/msgconv/igconv"
@@ -44,9 +43,6 @@ func (ic *IGConnector) Init(bridge *bridgev2.Bridge) {
 	ic.Bridge = bridge
 	ic.DB = metadb.New(bridge.ID, bridge.DB.Database, ic.Bridge.Log.With().Str("db_section", "meta").Logger())
 	ic.MsgConv = igconv.New(bridge, ic.DB)
-	bridge.Commands.(*commands.Processor).AddHandlers(cmdSchedule, cmdOfflineHours, cmdTimezone) // homestacks: held messages
-	bridge.Commands.(*commands.Processor).AddHandlers(cmdFreeze, cmdUnfreeze)                    // homestacks: frozen chats
-	bridge.Commands.(*commands.Processor).AddHandlers(cmdDeprecate)                              // homestacks: deprecated chats
 	ic.MsgConv.DisableViewOnce = ic.Config.DisableViewOnce
 }
 
@@ -55,15 +51,6 @@ func (ic *IGConnector) Start(ctx context.Context) error {
 	err := ic.DB.Upgrade(ctx)
 	if err != nil {
 		return bridgev2.DBUpgradeError{Err: err, Section: "meta"}
-	}
-	if err = ic.startHeldMessages(ctx); err != nil { // homestacks: held messages
-		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_heldmsg"}
-	}
-	if err = ic.startFreeze(ctx); err != nil { // homestacks: frozen chats
-		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_freeze"}
-	}
-	if err = ic.startDeprecated(ctx); err != nil { // homestacks: deprecated chats
-		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_deprecate"}
 	}
 	return nil
 }

@@ -51,7 +51,6 @@ type UserLoginMetadata struct {
 	NativePushKeys         *pushcrypto.NativePushKeys    `json:"native_push_keys,omitempty"`
 	InstagramNativeSession *types.InstagramNativeSession `json:"instagram_native_session,omitempty"`
 	HistoryDevice          *securehistory.Device         `json:"history_device,omitempty"`
-	Timezone               string                        `json:"timezone,omitempty"` // homestacks: `!ig timezone`
 
 	// Thread backfill state
 	BackfillCompleted bool `json:"backfill_completed,omitempty"`
@@ -62,7 +61,6 @@ func (m *UserLoginMetadata) CopyFrom(other any) {
 	if m.Platform.IsMessenger() && updated.Platform.IsMessenger() && m.HistoryDevice != nil {
 		updated.HistoryDevice = m.HistoryDevice
 	}
-	updated.Timezone = m.Timezone // homestacks: re-login must not forget `!ig timezone`
 	*m = updated
 }
 
@@ -88,8 +86,6 @@ type PortalMetadata struct {
 	IGThreadID string `json:"ig_thread_id,omitempty"`
 
 	EphemeralSettingTimestamp int64 `json:"ephemeral_setting_timestamp,omitempty"`
-
-	OfflineHours *OfflineHours `json:"offline_hours,omitempty"` // homestacks: `!ig offline-hours`
 
 	FetchAttempted atomic.Bool `json:"-"`
 }

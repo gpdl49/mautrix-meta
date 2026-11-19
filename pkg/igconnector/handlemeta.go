@@ -196,8 +196,6 @@ func (ic *IGClient) wrapChatResync(thread *slidetypes.ThreadInfo, useBundle bool
 		ChatInfo:            ic.wrapChatInfo(thread),
 		LatestMessageTS:     thread.LastActivityTimestampMS.Time,
 		BundledBackfillData: bundle,
-
-		CheckNeedsBackfillFunc: frozenBackfillCheck(ic.makePortalKey(thread.ThreadKey, thread.IsGroup), thread.LastActivityTimestampMS.Time), // homestacks: frozen chats
 	}
 }
 
@@ -307,13 +305,6 @@ func (ic *IGClient) handleDelta(ctx context.Context, d *slidetypes.Delta) (retEr
 		return fmt.Errorf("failed to ensure portal for thread %s: %w", d.ThreadIGID, err)
 	} else if portalKey.IsEmpty() {
 		log.Warn().Msg("Ignoring event with no portal")
-		return nil
-	}
-
-	if ic.checkFrozen(ctx, portalKey, d) { // homestacks: frozen chats
-		return nil
-	}
-	if ic.checkDeprecated(ctx, portalKey, d) { // homestacks: deprecated chats
 		return nil
 	}
 
