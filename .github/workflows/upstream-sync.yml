@@ -3,8 +3,10 @@ name: upstream-sync
 # Keeps the `homestacks` branch on top of upstream releases. Merges (never
 # rebases) the newest mautrix/meta release tag that is not yet in the
 # branch, verifies the fork still builds and passes its tests, pushes, tags
-# the result vX.Y.Z-hs.1 and hands it to publish.yml. On a merge conflict it
-# opens an issue and leaves the branch untouched. See HOMESTACKS.md.
+# the result vX.Y.Z-hs.1 and hands it to publish.yml. On a merge conflict the
+# run fails (GitHub's failed-run notification is the alert), lists the
+# conflicting files in its summary and leaves the branch untouched. See
+# HOMESTACKS.md.
 
 on:
   schedule:
@@ -13,7 +15,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
   packages: write
 
 concurrency:
@@ -71,22 +72,23 @@ jobs:
             exit 1
           fi
 
-      - name: Open issue on merge conflict
+      - name: Summarise merge conflict
         if: failure() && steps.merge.outcome == 'failure'
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.find.outputs.tag }}
           CONFLICTS: ${{ steps.merge.outputs.conflicts }}
         run: |
-          title="Upstream merge conflict: $TAG"
-          body=$(printf 'Automatic merge of upstream `%s` into `homestacks` failed.\n\nConflicting files:\n```\n%s\n```\n\nResolve by hand as described in HOMESTACKS.md, then re-run this workflow.\n\nRun: %s/%s/actions/runs/%s' \
-            "$TAG" "$CONFLICTS" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
-          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body "$body"
-          else
-            gh issue create --title "$title" --body "$body" --label upstream-sync
-          fi
+          {
+            echo "## Upstream merge conflict: $TAG"
+            echo
+            echo "Automatic merge of upstream \`$TAG\` into \`homestacks\` failed. Conflicting files:"
+            echo
+            echo '```'
+            echo "$CONFLICTS"
+            echo '```'
+            echo
+            echo "Resolve by hand as described in HOMESTACKS.md, then re-run this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-go@v7
         if: steps.merge.outputs.tag != ''
